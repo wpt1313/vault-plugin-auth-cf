@@ -13,7 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cloudfoundry-community/go-cfclient"
+	cfclient "github.com/cloudfoundry/go-cfclient/v3/client"
+	cfconfig "github.com/cloudfoundry/go-cfclient/v3/config"
 	"github.com/hashicorp/go-cleanhttp"
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/logical"
@@ -99,8 +100,8 @@ func (b *backend) updateCFClient(ctx context.Context, config *models.Configurati
 
 	b.cfClientTainted = false
 	if b.cfClient != nil {
-		if b.cfClient.Config.HttpClient != nil {
-			b.cfClient.Config.HttpClient.CloseIdleConnections()
+		if httpClient := b.cfClient.HTTPClient(); httpClient != nil {
+			httpClient.CloseIdleConnections()
 		}
 	}
 
@@ -140,16 +141,7 @@ func (b *backend) newCFClient(_ context.Context, config *models.Configuration) (
 	}
 
 	httpClient := cleanhttp.DefaultClient()
-	httpClient.Timeout = config.CFTimeout
 
-	clientConf := &cfclient.Config{
-		ApiAddress:   config.CFAPIAddr,
-		Username:     config.CFUsername,
-		Password:     config.CFPassword,
-		ClientID:     config.CFClientID,
-		ClientSecret: config.CFClientSecret,
-		HttpClient:   httpClient,
-	}
 	rootCAs, err := x509.SystemCertPool()
 	if err != nil {
 		return nil, err
@@ -180,7 +172,7 @@ func (b *backend) newCFClient(_ context.Context, config *models.Configuration) (
 		tlsConfig.Certificates = []tls.Certificate{cert}
 	}
 
-	clientConf.HttpClient.Transport = &http.Transport{
+	httpClient.Transport = &http.Transport{
 		TLSClientConfig: tlsConfig,
 		// IdleConnTimeout bounds how long idle keep-alive connections linger in
 		// the per-request transport before being closed. Without this, abandoned
@@ -189,9 +181,40 @@ func (b *backend) newCFClient(_ context.Context, config *models.Configuration) (
 		IdleConnTimeout: 90 * time.Second,
 	}
 
-	// unfortunately, cfclient.NewClient() has a nasty side effect of reaching out
-	// to the CF API. That means that the CF API must be reachable at the time of
-	// the call. The v3 of go-cfclient does not have this issue. Updating to v3
-	// should be a priority.
-	return cfclient.NewClient(clientConf)
+	options := []cfconfig.Option{
+		cfconfig.HttpClient(httpClient),
+	}
+	if config.CFTimeout > 0 {
+		options = append(options, cfconfig.RequestTimeout(config.CFTimeout))
+	}
+	// Client credentials take priority over username/password, matching the
+	// previous (v2) client's auth precedence, so operators relying on the
+	// client_id/client_secret grant continue to get it even if cf_username
+	// and cf_password are also present in storage (e.g. left over from a
+	// prior configuration).
+	switch {
+	case config.CFClientID != "" && config.CFClientSecret != "":
+		options = append(options, cfconfig.ClientCredentials(config.CFClientID, config.CFClientSecret))
+	case config.CFUsername != "" && config.CFPassword != "":
+		options = append(options, cfconfig.UserPassword(config.CFUsername, config.CFPassword))
+	}
+
+	// cfconfig.New() reaches out to the CF API to discover its UAA/login
+	// endpoints (and, for the password grant, to exchange credentials for a
+	// token). That means the CF API must be reachable at the time of the
+	// call. client.New() itself, however, performs no I/O.
+	cfg, err := cfconfig.New(config.CFAPIAddr, options...)
+	if err != nil {
+		return nil, err
+	}
+
+	if config.CFTimeout <= 0 {
+		// A non-positive CFTimeout means "no timeout". cfconfig.RequestTimeout
+		// rejects values <= 0 and falls back to its own default, so restore
+		// the "no timeout" behavior on the clients it built for us.
+		cfg.HTTPClient().Timeout = 0
+		cfg.HTTPAuthClient().Timeout = 0
+	}
+
+	return cfclient.New(cfg)
 }

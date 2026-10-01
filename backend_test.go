@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cloudfoundry-community/go-cfclient"
+	cfclient "github.com/cloudfoundry/go-cfclient/v3/client"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-secure-stdlib/parseutil"
 	"github.com/hashicorp/vault/sdk/logical"
@@ -895,7 +895,7 @@ func Test_backend_updateCFClient(t *testing.T) {
 			name:           "updated-config-hash-change",
 			config:         newConfig(t),
 			lastConfigHash: &defaultConfigHash,
-			cfClient:       &cfclient.Client{},
+			cfClient:       newTestCFClient(t),
 			wantErr:        assert.NoError,
 			wantUpdated:    true,
 			withMockServer: true,
@@ -987,11 +987,10 @@ func Test_backend_newCFClient(t *testing.T) {
 				CFPassword: "password",
 			},
 			wantErr: func(t assert.TestingT, err error, msgAndArgs ...any) bool {
-				// expect the error returned by the call to cfclient.NewClient(), which gets the
-				// /v2/info on initialization. We will need to adapt/drop this test when we
-				// upgrade to v3 of the client.
+				// expect the error returned by cfconfig.New() while discovering
+				// the login/UAA endpoints from the CF API root.
 				return assert.ErrorContains(t, err,
-					"Could not get api /v2/info: Get", msgAndArgs...)
+					"error while discovering token service URL", msgAndArgs...)
 			},
 		},
 		{
@@ -1062,12 +1061,7 @@ func Test_backend_getCFClient(t *testing.T) {
 
 	ctx := context.Background()
 
-	defaultClient := &cfclient.Client{
-		Config: cfclient.Config{
-			ApiAddress: "https://api.example.com",
-		},
-		Endpoint: cfclient.Endpoint{},
-	}
+	defaultClient := newTestCFClient(t)
 	tests := []struct {
 		name     string
 		cfClient *cfclient.Client
@@ -1197,4 +1191,27 @@ func newConfig(t *testing.T) *models.Configuration {
 		CFUsername: "admin",
 		CFPassword: "password",
 	}
+}
+
+// newTestCFClient builds a real, fully-initialized *cfclient.Client backed by
+// a short-lived mock CF API server. Unlike the v2 client, go-cfclient/v3's
+// Client embeds an unexported *config.Config, so an empty &cfclient.Client{}
+// literal has a nil embedded config and will panic if code calls any of its
+// promoted methods (e.g. HTTPClient()). Tests that need a non-nil, usable
+// client fixture -- as opposed to merely a non-nil pointer -- should use this
+// helper instead of a bare struct literal.
+func newTestCFClient(t *testing.T) *cfclient.Client {
+	t.Helper()
+
+	s := cf.MockServer(false, nil)
+	t.Cleanup(s.Close)
+
+	b := &backend{}
+	client, err := b.newCFClient(context.Background(), &models.Configuration{
+		CFAPIAddr:  s.URL,
+		CFUsername: cf.AuthUsername,
+		CFPassword: cf.AuthPassword,
+	})
+	require.NoError(t, err)
+	return client
 }

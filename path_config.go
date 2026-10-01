@@ -431,8 +431,8 @@ func (b *backend) operationConfigWrite(ctx context.Context, req *logical.Request
 		// in per-request client mode (and so switching back to cached mode forces a refresh).
 		b.cfClientMu.Lock()
 		if b.cfClient != nil {
-			if b.cfClient.Config.HttpClient != nil {
-				b.cfClient.Config.HttpClient.CloseIdleConnections()
+			if httpClient := b.cfClient.HTTPClient(); httpClient != nil {
+				httpClient.CloseIdleConnections()
 			}
 			b.cfClient = nil
 			b.lastConfigHash = nil

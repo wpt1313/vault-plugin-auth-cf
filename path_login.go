@@ -1,4 +1,5 @@
 // Copyright IBM Corp. 2019, 2025
+// Copyright IBM Corp. 2019, 2025
 // SPDX-License-Identifier: MPL-2.0
 
 package cf
@@ -10,7 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cloudfoundry-community/go-cfclient"
+	cfclient "github.com/cloudfoundry/go-cfclient/v3/client"
+	"github.com/cloudfoundry/go-cfclient/v3/resource"
 	"github.com/hashicorp/go-secure-stdlib/strutil"
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/helper/cidrutil"
@@ -242,21 +244,21 @@ func (b *backend) operationLoginUpdate(ctx context.Context, req *logical.Request
 		return logical.ErrorResponse(err.Error()), nil
 	}
 
-	if err := b.validate(client, role, cfCert, req.Connection.RemoteAddr); err != nil {
+	if err := b.validate(ctx, client, role, cfCert, req.Connection.RemoteAddr); err != nil {
 		return logical.ErrorResponse(err.Error()), nil
 	}
 
-	orgName, err := b.getOrgName(client, cfCert)
+	orgName, err := b.getOrgName(ctx, client, cfCert)
 	if err != nil {
 		return nil, err
 	}
 
-	appName, err := b.getAppName(client, cfCert)
+	appName, err := b.getAppName(ctx, client, cfCert)
 	if err != nil {
 		return nil, err
 	}
 
-	spaceName, err := b.getSpaceName(client, cfCert)
+	spaceName, err := b.getSpaceName(ctx, client, cfCert)
 	if err != nil {
 		return nil, err
 	}
@@ -354,7 +356,7 @@ func (b *backend) pathLoginRenew(ctx context.Context, req *logical.Request, data
 		return logical.ErrorResponse(err.Error()), nil
 	}
 
-	if err := b.validate(client, role, cfCert, req.Connection.RemoteAddr); err != nil {
+	if err := b.validate(ctx, client, role, cfCert, req.Connection.RemoteAddr); err != nil {
 		// taint the client on error so that it will be refreshed on the next login attempt
 		b.cfClientTainted = true
 		return logical.ErrorResponse(err.Error()), nil
@@ -367,7 +369,7 @@ func (b *backend) pathLoginRenew(ctx context.Context, req *logical.Request, data
 	return resp, nil
 }
 
-func (b *backend) validate(client *cfclient.Client, role *models.RoleEntry, cfCert *models.CFCertificate, reqConnRemoteAddr string) error {
+func (b *backend) validate(ctx context.Context, client *cfclient.Client, role *models.RoleEntry, cfCert *models.CFCertificate, reqConnRemoteAddr string) error {
 	if !role.DisableIPMatching {
 		if !matchesIPAddress(reqConnRemoteAddr, net.ParseIP(cfCert.IPAddress)) {
 			return errors.New("no matching IP address")
@@ -391,45 +393,51 @@ func (b *backend) validate(client *cfclient.Client, role *models.RoleEntry, cfCe
 	// but currently there's no known way to do that via the cf API.
 
 	// Check everything we can using the app ID.
-	app, err := client.AppByGuid(cfCert.AppID)
+	app, err := client.Applications.Get(ctx, cfCert.AppID)
 	if err != nil {
 		return err
 	}
-	if app.Guid != cfCert.AppID {
-		return fmt.Errorf("cert app ID %s doesn't match API's expected one of %s", cfCert.AppID, app.Guid)
+	if app.GUID != cfCert.AppID {
+		return fmt.Errorf("cert app ID %s doesn't match API's expected one of %s", cfCert.AppID, app.GUID)
 	}
-	if app.SpaceGuid != cfCert.SpaceID {
-		return fmt.Errorf("cert space ID %s doesn't match API's expected one of %s", cfCert.SpaceID, app.SpaceGuid)
+	appSpaceID := appSpaceGUID(app)
+	if appSpaceID != cfCert.SpaceID {
+		return fmt.Errorf("cert space ID %s doesn't match API's expected one of %s", cfCert.SpaceID, appSpaceID)
 	}
-	if app.Instances <= 0 {
+	hasLiveInstances, err := appHasLiveInstances(ctx, client, cfCert.AppID)
+	if err != nil {
+		return err
+	}
+	if !hasLiveInstances {
 		return errors.New("app doesn't have any live instances")
 	}
 
 	// Check everything we can using the org ID.
-	org, err := client.GetOrgByGuid(cfCert.OrgID)
+	org, err := client.Organizations.Get(ctx, cfCert.OrgID)
 	if err != nil {
 		return err
 	}
-	if org.Guid != cfCert.OrgID {
-		return fmt.Errorf("cert org ID %s doesn't match API's expected one of %s", cfCert.OrgID, org.Guid)
+	if org.GUID != cfCert.OrgID {
+		return fmt.Errorf("cert org ID %s doesn't match API's expected one of %s", cfCert.OrgID, org.GUID)
 	}
 
 	// Check everything we can using the space ID.
-	space, err := client.GetSpaceByGuid(cfCert.SpaceID)
+	space, err := client.Spaces.Get(ctx, cfCert.SpaceID)
 	if err != nil {
 		return err
 	}
-	if space.Guid != cfCert.SpaceID {
-		return fmt.Errorf("cert space ID %s doesn't match API's expected one of %s", cfCert.SpaceID, space.Guid)
+	if space.GUID != cfCert.SpaceID {
+		return fmt.Errorf("cert space ID %s doesn't match API's expected one of %s", cfCert.SpaceID, space.GUID)
 	}
-	if space.OrganizationGuid != cfCert.OrgID {
-		return fmt.Errorf("cert org ID %s doesn't match API's expected one of %s", cfCert.OrgID, space.OrganizationGuid)
+	spaceOrgGUID := spaceOrganizationGUID(space)
+	if spaceOrgGUID != cfCert.OrgID {
+		return fmt.Errorf("cert org ID %s doesn't match API's expected one of %s", cfCert.OrgID, spaceOrgGUID)
 	}
 	return nil
 }
 
-func (b *backend) getOrgName(client *cfclient.Client, cfCert *models.CFCertificate) (string, error) {
-	org, err := client.GetOrgByGuid(cfCert.OrgID)
+func (b *backend) getOrgName(ctx context.Context, client *cfclient.Client, cfCert *models.CFCertificate) (string, error) {
+	org, err := client.Organizations.Get(ctx, cfCert.OrgID)
 	if err != nil {
 		return "", err
 	}
@@ -437,8 +445,8 @@ func (b *backend) getOrgName(client *cfclient.Client, cfCert *models.CFCertifica
 	return org.Name, nil
 }
 
-func (b *backend) getAppName(client *cfclient.Client, cfCert *models.CFCertificate) (string, error) {
-	app, err := client.AppByGuid(cfCert.AppID)
+func (b *backend) getAppName(ctx context.Context, client *cfclient.Client, cfCert *models.CFCertificate) (string, error) {
+	app, err := client.Applications.Get(ctx, cfCert.AppID)
 	if err != nil {
 		return "", err
 	}
@@ -446,13 +454,49 @@ func (b *backend) getAppName(client *cfclient.Client, cfCert *models.CFCertifica
 	return app.Name, nil
 }
 
-func (b *backend) getSpaceName(client *cfclient.Client, cfCert *models.CFCertificate) (string, error) {
-	space, err := client.GetSpaceByGuid(cfCert.SpaceID)
+func (b *backend) getSpaceName(ctx context.Context, client *cfclient.Client, cfCert *models.CFCertificate) (string, error) {
+	space, err := client.Spaces.Get(ctx, cfCert.SpaceID)
 	if err != nil {
 		return "", err
 	}
 
 	return space.Name, nil
+}
+
+// appSpaceGUID returns the GUID of the space the app belongs to, or an empty
+// string if the relationship isn't populated.
+func appSpaceGUID(app *resource.App) string {
+	if app == nil || app.Relationships.Space.Data == nil {
+		return ""
+	}
+	return app.Relationships.Space.Data.GUID
+}
+
+// spaceOrganizationGUID returns the GUID of the organization the space
+// belongs to, or an empty string if the relationship isn't populated.
+func spaceOrganizationGUID(space *resource.Space) string {
+	if space == nil || space.Relationships == nil || space.Relationships.Organization == nil ||
+		space.Relationships.Organization.Data == nil {
+		return ""
+	}
+	return space.Relationships.Organization.Data.GUID
+}
+
+// appHasLiveInstances reports whether the app has at least one process
+// configured to run with one or more instances. Unlike the v2 API, the CF v3
+// API doesn't expose an instance count directly on the app resource; it's
+// tracked per-process instead.
+func appHasLiveInstances(ctx context.Context, client *cfclient.Client, appGUID string) (bool, error) {
+	processes, err := client.Processes.ListForAppAll(ctx, appGUID, nil)
+	if err != nil {
+		return false, err
+	}
+	for _, process := range processes {
+		if process.Instances > 0 {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func meetsBoundConstraints(certValue string, constraints []string) bool {
